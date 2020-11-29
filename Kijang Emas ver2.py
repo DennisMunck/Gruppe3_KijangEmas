@@ -248,34 +248,36 @@ plt.legend()
 plt.show()
 
 
-# # Predictive Modelling
-# # Lineare Regression
+#### Predictive Modelling ####
 
-# In[56]:
-
-
-from sklearn.linear_model import LinearRegression
-
-
-# In[60]:
-
-
-0.8*len(selling)
-
-
-# In[61]:
-
-
+## generate Data for Backtesting scenario
 train_selling = selling[: int(0.8 * len(selling))]
-test_selling = selling[int(0.8 * len(selling)) :]
-
-
-# In[62]:
-
+test_selling = selling[int(0.8 * len(selling)) :]   
 
 future_count = len(test_selling)
 future_count
 
+## generate Data for Forecasting scenario
+
+from datetime import timedelta, date
+    def daterange(date1, date2):
+        for n in range(int ((date2 - date1).days)+1):
+            yield date1 + timedelta(n)
+            
+    for dt in daterange(date(2020,11,1),date(2021,1,1)):
+        print(dt.strftime("%Y-%m-%d"))
+
+train_selling_fc= selling[:int(len(selling))]
+test_selling_fc = dt.strftime("%Y-%m-%d")
+
+future_count = len(test_selling_fc)
+future_count
+
+
+### Lineare Regression
+# In[56]:
+
+from sklearn.linear_model import LinearRegression
 
 # In[63]:
 
@@ -298,8 +300,167 @@ plt.xticks(
 plt.legend()
 plt.show()
 
+### LSTM
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
 
-# In[67]:
+## Modellerstellung
+class Model:
+    def __init__(
+        self,
+        learning_rate,
+        num_layers,
+        size,
+        size_layer,
+        output_size,
+        forget_bias = 0.1,
+    ):
+        def lstm_cell(size_layer):
+            return tf.compat.v1.nn.rnn_cell.LSTMCell(size_layer, state_is_tuple = False)
+
+        rnn_cells = tf.compat.v1.nn.rnn_cell.MultiRNNCell(
+            [lstm_cell(size_layer) for _ in range(num_layers)],
+            state_is_tuple = False,
+        )
+        self.X = tf.placeholder(tf.float32, (None, None, size))
+        self.Y = tf.placeholder(tf.float32, (None, output_size))
+        drop = tf.compat.v1.nn.rnn_cell.DropoutWrapper(
+            rnn_cells, output_keep_prob = forget_bias
+        )
+        self.hidden_layer = tf.placeholder(
+            tf.float32, (None, num_layers * 2 * size_layer)
+        )
+        self.outputs, self.last_state = tf.nn.dynamic_rnn(
+            drop, self.X, initial_state = self.hidden_layer, dtype = tf.float32
+        )
+        self.logits = tf.layers.dense(self.outputs[-1], output_size)
+        self.cost = tf.reduce_mean(tf.square(self.Y - self.logits))
+        self.optimizer = tf.train.AdamOptimizer(learning_rate).minimize(
+            self.cost
+        )
+
+## Definition der Parameter (variabel anpassbar)     
+
+num_layers = 1
+size_layer = 128
+epoch = 500
+dropout_rate = 0.6
+skip = 10
+
+#
+from sklearn.preprocessing import MinMaxScaler
+df = pd.DataFrame({'values': train_selling})
+minmax = MinMaxScaler().fit(df)
+df_log = minmax.transform(df)
+df_log = pd.DataFrame(df_log)
+df_log.head()
+
+#
+modelnn = Model(
+    learning_rate = 0.001, 
+    num_layers = num_layers, 
+    size = df_log.shape[1], 
+    size_layer = size_layer, 
+    output_size = df_log.shape[1], 
+    forget_bias = dropout_rate
+)
+sess = tf.InteractiveSession()
+sess.run(tf.global_variables_initializer())
+
+#
+%%time
+
+for i in range(epoch):
+    init_value = np.zeros((1, num_layers * 2 * size_layer))
+    total_loss = 0
+    for k in range(0, df_log.shape[0] - 1, skip):
+        index = min(k + skip, df_log.shape[0] -1)
+        batch_x = np.expand_dims(
+            df_log.iloc[k : index, :].values, axis = 0
+        )
+        batch_y = df_log.iloc[k + 1 : index + 1, :].values
+        last_state, _, loss = sess.run(
+            [modelnn.last_state, modelnn.optimizer, modelnn.cost],
+            feed_dict = {
+                modelnn.X: batch_x,
+                modelnn.Y: batch_y,
+                modelnn.hidden_layer: init_value,
+            },
+        )
+        init_value = last_state
+        total_loss += loss
+    total_loss /= ((df_log.shape[0] - 1) / skip)
+    if (i + 1) % 100 == 0:
+        print('epoch:', i + 1, 'avg loss:', total_loss)
+        
+#
+df = pd.DataFrame({'values': train_selling})
+minmax = MinMaxScaler().fit(df)
+df_log = minmax.transform(df)
+df_log = pd.DataFrame(df_log)
+future_day = future_count
+
+output_predict = np.zeros((df_log.shape[0] + future_day, df_log.shape[1]))
+output_predict[0] = df_log.iloc[0]
+upper_b = (df_log.shape[0] // skip) * skip
+init_value = np.zeros((1, num_layers * 2 * size_layer))
+for k in range(0, (df_log.shape[0] // skip) * skip, skip):
+    out_logits, last_state = sess.run(
+        [modelnn.logits, modelnn.last_state],
+        feed_dict = {
+            modelnn.X: np.expand_dims(
+                df_log.iloc[k : k + skip], axis = 0
+            ),
+            modelnn.hidden_layer: init_value,
+        },
+    )
+    init_value = last_state
+    output_predict[k + 1 : k + skip + 1] = out_logits
+
+if upper_b < df_log.shape[0]:
+    out_logits, last_state = sess.run(
+        [modelnn.logits, modelnn.last_state],
+        feed_dict = {
+            modelnn.X: np.expand_dims(df_log.iloc[upper_b:], axis = 0),
+            modelnn.hidden_layer: init_value,
+        },
+    )
+    init_value = last_state
+    output_predict[upper_b + 1 : df_log.shape[0] + 1] = out_logits
+    df_log.loc[df_log.shape[0]] = out_logits[-1]
+    future_day = future_day - 1
+    
+for i in range(future_day):
+    out_logits, last_state = sess.run(
+        [modelnn.logits, modelnn.last_state],
+        feed_dict = {
+            modelnn.X: np.expand_dims(df_log.iloc[-skip:], axis = 0),
+            modelnn.hidden_layer: init_value,
+        },
+    )
+    init_value = last_state
+    output_predict[df_log.shape[0]] = out_logits[-1]
+    df_log.loc[df_log.shape[0]] = out_logits[-1]
+
+# 
+df_log = minmax.inverse_transform(output_predict)
+lstm_future = df_log[:,0]
+    
+# plot 
+fig, ax = plt.subplots(figsize = (15, 5))
+ax.plot(selling, label = '20% test trend')
+ax.plot(train_selling, label = '80% train trend')
+ax.plot(lstm_future, label='forecast lstm')
+plt.xticks(
+    np.arange(len(timestamp))[::10],
+    np.arange(len(timestamp))[::10],
+    rotation = '45',
+)
+plt.legend()
+plt.show()
+    
+    
+### Evaluation
 
 
 from sklearn.metrics import r2_score
@@ -346,7 +507,7 @@ def calculate_distance(real, predict):
 
 linear_cut = linear_future[: len(train_selling)]
 #arima_cut = arima_future[: len(train_selling)]
-#lstm_cut = lstm_future[: len(train_selling)]
+lstm_cut = lstm_future[: len(train_selling)]
 
 
 # 80%
@@ -355,13 +516,13 @@ linear_cut = linear_future[: len(train_selling)]
 
 
 calculate_distance(train_selling, linear_cut)
-
+calculate_distance(train_selling, lstm_cut)
 
 # In[73]:
 
 
 calculate_accuracy(train_selling, linear_cut)
-
+calculate_accuracy(train_selling, lstm_cut)
 
 # 20%
 
@@ -369,21 +530,8 @@ calculate_accuracy(train_selling, linear_cut)
 
 
 linear_cut = linear_future[len(train_selling) :]
+lstm_cut = lstm_future[: len(train_selling)]
 
-
-# In[79]:
-
-
-calculate_distance(test_selling, linear_cut)
-
-
-# In[80]:
-
-
-calculate_accuracy(test_selling, linear_cut)
-
-
-# In[ ]:
 
 
 
